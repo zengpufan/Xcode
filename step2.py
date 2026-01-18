@@ -177,7 +177,7 @@ class LanguageEmbeddingProcessor:
             lang = cluster['dominant_lang']
             lang_cluster_count[lang] = lang_cluster_count.get(lang, 0) + 1
         for lang, count in lang_cluster_count.items():
-            print(f"{lang} 语言主导聚类数：{count}")
+            print(f"{lang} : {count}")
 
         return single_lang_clusters
 
