@@ -4,9 +4,9 @@ A multilingual Wikipedia entity clustering analysis project — performing Named
 
 ## Overview
 
-This project implements a complete **multilingual Wikipedia text semantic mining pipeline**. It extracts text from 9 language editions of the Wikimedia Wikipedia dataset, filters high-quality articles via spaCy NER, generates cross-lingual embeddings using Sentence-BERT, performs clustering with cuML GPU-accelerated KMeans, optimizes cluster quality via density and semantic entropy, and produces academic-grade visualizations.
+This project implements a complete **multilingual Wikipedia text semantic mining pipeline**. It extracts text from 6 language editions of the Wikimedia Wikipedia dataset, filters high-quality articles via spaCy NER, generates cross-lingual embeddings using Sentence-BERT, performs clustering with cuML GPU-accelerated KMeans, optimizes cluster quality via density and semantic entropy, and produces academic-grade visualizations.
 
-**Supported Languages (9)**: `en`, `zh`, `de`, `fr`, `es`, `it`, `nl`, `pt`, `ja`
+**Supported Languages (9)**: `en`, `zh`, `de`, `fr`, `es`, `ja`
 
 ## Pipeline
 
