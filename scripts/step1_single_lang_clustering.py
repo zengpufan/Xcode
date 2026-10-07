@@ -1,293 +1,161 @@
-import os
-import numpy as np
+"""Stage 1 of C-Mining: monolingual high-quality data filtering.
+
+For each language this pipeline:
+1. loads the NER-selected entries (from step0),
+2. encodes ``<title> T <text> P1`` with a frozen multilingual encoder,
+3. KMeans-clusters them into broad thematic domains,
+4. within each cluster applies Local Dispersion (Eq. 1) + Semantic Entropy
+   (Eq. 2-3) to retain representative, semantically deep candidates, and
+5. keeps the top-``TOP_FRACTION`` by entropy as ``C_high`` for that language.
+
+The density + entropy selection that previously lived in
+``sample_high_quality_data.py`` is merged here so embeddings are computed
+exactly once per language.
+
+Output (per language): ``{SINGLE_LANG_OUTPUT_DIR}/{lang}_high_quality.jsonl``
+plus ``{lang}_clusters.json`` for inspection.
+"""
 import json
+import os
+import sys
+from typing import List
+
+import numpy as np
 from datasets import load_dataset
-from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
-from cuml import KMeans as cuKMeans
-from typing import List, Dict, Any, Optional
 
-class LanguageEmbeddingProcessor:
-    """
-    Processor for language-specific embeddings and clustering.
-    
-    This class loads filtered Wikipedia data, computes embeddings using sentence transformers,
-    and performs clustering analysis on the embeddings.
-    """
-    
-    def __init__(self,
-                 lang_code: str, 
-                 device: str = 'cuda', 
-                 cache_dir: Optional[str] = None, 
-                 output_dir: Optional[str] = None, 
-                 max_elements: int = 10000,
-                 model: Optional[SentenceTransformer] = None):
-        """
-        Initialize the processor.
-        
-        Args:
-            lang_code: Language code (e.g., 'en', 'de', 'fr')
-            device: Device for computation ('cuda' or 'cpu')
-            cache_dir: Directory for dataset caching
-            output_dir: Directory for output files
-            max_elements: Maximum number of elements to process
-            model: Pre-loaded sentence transformer model
-        """
-        self.lang_code = lang_code
-        self.device = device
-        self.cache_dir = cache_dir
-        self.output_dir = output_dir
-        self.max_elements = max_elements
-        
-        # Initialize model
-        if model is not None:
-            self.model = model
-        else:
-            try:
-                self.model = SentenceTransformer('all-MiniLM-L6-v2', device=self.device)
-            except Exception as e:
-                raise RuntimeError(f"Failed to load sentence transformer model: {e}")
-        
-        # Create output directory
-        if self.output_dir:
-            os.makedirs(self.output_dir, exist_ok=True)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from common import (
+    entropy_of_similarity,
+    first_paragraph,
+    format_input,
+    get_embedder,
+    get_kmeans,
+    local_dispersion,
+    read_jsonl,
+    write_jsonl,
+)
+from config import (
+    DATASET_CACHE_DIR,
+    DATASET_DATE,
+    DATASET_NAME,
+    KNN_K,
+    LANG_LIST,
+    N_CLUSTERS_PER_LANG,
+    NER_OUTPUT_DIR,
+    SINGLE_LANG_OUTPUT_DIR,
+    TOP_FRACTION,
+)
 
-    def load_data(self, dataset_name: str = "wikimedia/wikipedia", date: str = "20231101") -> None:
-        """
-        Load and filter dataset data.
-        
-        Args:
-            dataset_name: Name of the dataset
-            date: Dataset version date
-            
-        Raises:
-            FileNotFoundError: If filtered data file doesn't exist
-            ValueError: If data is invalid
-        """
-        print(f"Loading dataset {dataset_name} for language {self.lang_code}...")
-        
-        try:
-            # Load main dataset
-            print("Loading main Wikipedia dataset...")
-            data = load_dataset(dataset_name, f"{date}.{self.lang_code}", cache_dir=self.cache_dir)
-            # dataset_size = min(len(data['train']), self.max_elements) if self.max_elements else len(data['train'])
-            self.data = data['train']
-            self.titles = self.data['title']
-            self.texts = self.data['text']
-            self.texts = [text.split('\n')[0] if text else "" for text in self.texts]
-            print(f"✓ Loaded {len(self.data)} samples from main dataset.")
 
-            # Load filtered data
-            print("Loading filtered NER data...")
-            filtered_file_path = os.path.join("ner_processed_data_v2", self.lang_code, f"{self.lang_code}_selected_data.json")
-            if not os.path.exists(filtered_file_path):
-                raise FileNotFoundError(f"Filtered data file not found: {filtered_file_path}")
-            
-            with open(filtered_file_path, 'r', encoding='utf-8') as f:
-                filtered_data = []
-                lines = f.readlines()
-                for line in tqdm(lines, desc="Processing filtered data"):
-                    try:
-                        item = json.loads(line.strip())
-                        filtered_data.append(item)
-                    except json.JSONDecodeError:
-                        continue
-            
-            if not filtered_data:
-                raise ValueError(f"No valid filtered data found for language {self.lang_code}")
-            
-            selected_indices = [item['index'] for item in tqdm(filtered_data, desc="Processing filtered data")]
-            # Validate indices
-            valid_indices = []
-            for idx in selected_indices:
-                if 0 <= idx < len(self.titles):
-                    valid_indices.append(idx)
-                else:
-                    print(f"Warning: Invalid index {idx} for dataset size {len(self.titles)}")
-            
-            # Filter data using valid indices
-            self.selected_titles = [self.titles[i] for i in tqdm(valid_indices, desc="Filtering titles")]
-            self.selected_texts = [self.texts[i] for i in tqdm(valid_indices,desc="Filtering texts")]
-            self.selected_indices = valid_indices
-            
-            print(f"Selected {len(self.selected_texts)} samples after filtering.")
-            
-        except Exception as e:
-            raise RuntimeError(f"Failed to load data for {self.lang_code}: {e}")
+def _load_selected(lang: str):
+    """Read NER-selected records and fetch their title + first paragraph."""
+    sel_path = os.path.join(NER_OUTPUT_DIR, lang, f"{lang}_selected_data.jsonl")
+    records = read_jsonl(sel_path)
+    if not records:
+        raise RuntimeError(f"No NER-selected entries for {lang} at {sel_path}")
+    indices = [r["index"] for r in records]
 
-    def compute_embeddings(self, batch_size: int = 64) -> None:
-        """
-        Compute embeddings for selected texts.
-        
-        Args:
-            batch_size: Batch size for embedding computation
-            
-        Raises:
-            RuntimeError: If embedding computation fails
-        """
-        if not hasattr(self, 'selected_texts') or not self.selected_texts:
-            raise ValueError("No data loaded. Call load_data() first.")
-        
-        print("Computing embeddings...")
-        
-        try:
-            # Prepare input texts with proper formatting
-            input_texts = []
-            for title, text in zip(self.selected_titles, self.selected_texts):
-                # Clean and format text
-                clean_title = title.strip() if title else ""
-                clean_text = text.strip() if text else ""
-                if clean_title or clean_text:
-                    input_texts.append(f"<title> {clean_title} <text> {clean_text}")
-            
-            if not input_texts:
-                raise ValueError("No valid texts to encode")
-            
-            # Compute embeddings with enhanced progress bar
-            print(f"Computing embeddings for {len(input_texts)} texts...")
-            self.embeddings = self.model.encode(
-                input_texts, 
-                batch_size=batch_size, 
-                show_progress_bar=True,
-                # batch_progress_bar=True,
-                convert_to_numpy=True
-            )
-            
-            print(f"Computed embeddings for {len(self.embeddings)} samples.")
-            print(f"Embedding shape: {self.embeddings.shape}")
-            
-        except Exception as e:
-            raise RuntimeError(f"Failed to compute embeddings: {e}")
+    data = load_dataset(
+        DATASET_NAME, f"{DATASET_DATE}.{lang}", cache_dir=DATASET_CACHE_DIR
+    )["train"]
+    sub = data.select(indices)
+    titles = [r["title"] for r in records]
+    paragraphs = [first_paragraph(t) if t else "" for t in sub["text"]]
+    return titles, paragraphs, indices
 
-    def cluster_embeddings(self, n_clusters: int = 100) -> None:
-        """
-        Perform clustering on embeddings.
-        
-        Args:
-            n_clusters: Number of clusters (if None, will be auto-calculated)
-            
-        Raises:
-            RuntimeError: If clustering fails
-        """
-        if not hasattr(self, 'embeddings') or self.embeddings is None:
-            raise ValueError("No embeddings computed. Call compute_embeddings() first.")
-        
-        # Calculate optimal number of clusters if not provided
-        n_clusters = max(2, len(self.embeddings) // 10)
-        print(f"Using specified number of clusters: {n_clusters}")
-        
-        # Ensure we don't have more clusters than samples
-        n_clusters = min(n_clusters, len(self.embeddings))
-        
-        try:
-            print(f"Clustering {len(self.embeddings)} embeddings into {n_clusters} clusters...")
-            
-            # Perform clustering
-            kmeans = cuKMeans(n_clusters=n_clusters, random_state=42)
-            self.cluster_labels = kmeans.fit_predict(self.embeddings)
-            print("Clustering completed.")
 
-            # Group indices by cluster for efficient processing
-            cluster_indices = {}
-            for idx, label in enumerate(self.cluster_labels):
-                if label not in cluster_indices:
-                    cluster_indices[label] = []
-                cluster_indices[label].append(idx)
+def _semantic_units(text: str) -> list[str]:
+    """Paragraphs for entropy. The leading paragraph alone yields H=0, so when
+    the article has no second newline-delimited paragraph we fall back to
+    sentence splitting to keep the metric meaningful."""
+    paras = [p.strip() for p in text.split("\n") if p.strip()]
+    if len(paras) < 2 and len(text) > 40:
+        paras = [s.strip() for s in text.replace("。", ".\n").split("\n") if s.strip()]
+    return paras if paras else [text]
 
-            # Prepare cluster data
-            cluster_data = []
-            for cluster_id in range(n_clusters):
-                indices = cluster_indices.get(cluster_id, [])
-                cluster_size = len(indices)
-                print(f"Cluster {cluster_id}: {cluster_size} samples")
-                
-                # Extract data for this cluster
-                cluster_info = {
-                    "cluster_id": cluster_id,
-                    "cluster_size": cluster_size,
-                    "titles": [self.selected_titles[idx] for idx in indices],
-                    "indices": [self.selected_indices[idx] for idx in indices]
-                }
-                cluster_data.append(cluster_info)
-            
-            # Save cluster data
-            if self.output_dir:
-                cluster_file_name = os.path.join(self.output_dir, f"{self.lang_code}_clusters.json")
-                with open(cluster_file_name, 'w', encoding='utf-8') as f:
-                    json.dump(cluster_data, f, ensure_ascii=False, indent=4)
-                print(f"Cluster data saved to: {cluster_file_name}")
-            
-            print(f"Clustering summary: {len(cluster_data)} clusters created")
-            
-        except Exception as e:
-            raise RuntimeError(f"Failed to perform clustering: {e}")
-    
 
-def run() -> None:
-    """
-    Main function to run the language embedding processing pipeline.
-    """
-    # Configuration
-    # lang_list = ['zh', 'de', 'fr']
-    lang_list = ['ja']
-    cache_dir = './dataset_cache'
-    output_base_dir = './output_single_lang_clusters'
-    device = "cuda:0"
-    batch_size = 128
-    max_elements = None  # Set to a number to limit processing, None for all data
-    
-    print("Starting language embedding processing pipeline")
-    print(f"Languages: {lang_list}")
-    print(f"Device: {device}")
-    print(f"Output directory: {output_base_dir}")
-    
-    # Create output directory
-    os.makedirs(output_base_dir, exist_ok=True)
-    
-    # Initialize model once for efficiency
-    try:
-        model = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2', device=device)
-        print("Sentence transformer model loaded successfully")
-    except Exception as e:
-        print(f"Failed to load model: {e}")
-        return
-    
-    # Process each language
-    for lang_code in lang_list:
-        print(f"\n{'='*50}")
-        print(f"Processing language: {lang_code}")
-        print(f"{'='*50}")
-        
-        try:
-            processor = LanguageEmbeddingProcessor(
-                lang_code=lang_code,
-                device=device,
-                cache_dir=cache_dir,
-                output_dir=output_base_dir,
-                max_elements=max_elements,
-                model=model
-            )
-            
-            # Load data
-            processor.load_data()
-            
-            # Compute embeddings
-            processor.compute_embeddings(batch_size=batch_size)
-            
-            # Perform clustering
-            processor.cluster_embeddings(n_clusters=100)
-            
-            print(f"Successfully completed processing for {lang_code}")
-            
-        except Exception as e:
-            print(f"Error processing {lang_code}: {e}")
+def _process_lang(lang: str, embedder, out_dir: str) -> None:
+    titles, paragraphs, indices = _load_selected(lang)
+    inputs = [format_input(t, p) for t, p in zip(titles, paragraphs)]
+    embeddings = embedder.encode(
+        inputs, batch_size=128, show_progress_bar=True, convert_to_numpy=True
+    )
+
+    n_clusters = min(N_CLUSTERS_PER_LANG, len(embeddings))
+    labels = get_kmeans(n_clusters).fit_predict(embeddings)
+
+    by_cluster: dict[int, list[int]] = {}
+    for i, lab in enumerate(labels):
+        by_cluster.setdefault(int(lab), []).append(i)
+
+    summary = [
+        {"cluster_id": c, "size": len(members),
+         "titles": [titles[i] for i in members],
+         "indices": [indices[i] for i in members]}
+        for c, members in sorted(by_cluster.items())
+    ]
+    with open(os.path.join(out_dir, f"{lang}_clusters.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False)
+
+    high_quality = []
+    for c, members in tqdm(by_cluster.items(), desc=f"[{lang}] density+entropy"):
+        if len(members) <= KNN_K:
             continue
-    
-    print(f"\n{'='*50}")
-    print("Language embedding processing pipeline completed")
-    print(f"{'='*50}")
+        cluster_emb = embeddings[members]
+
+        # (1) Local Dispersion δ_m (Eq. 1): keep δ_m ≤ cluster median.
+        disp = local_dispersion(cluster_emb, k=KNN_K)
+        median = np.median(disp)
+        dense_mask = disp <= median
+        if not dense_mask.any():
+            dense_mask = np.ones(len(disp), dtype=bool)
+        # (local_pos, global_idx, disp_value) for kept entries.
+        kept = [(j, members[j], float(disp[j]))
+                for j in np.where(dense_mask)[0]]
+
+        # (2) Semantic Entropy H(D): batch-encode all kept docs' units at once.
+        doc_units = [_semantic_units(paragraphs[gi]) for _, gi, _ in kept]
+        flat = [u for units in doc_units for u in units]
+        para_emb = (embedder.encode(flat, batch_size=256, show_progress_bar=False,
+                                    convert_to_numpy=True)
+                    if flat else np.zeros((0, 1), dtype=np.float32))
+
+        offset = 0
+        candidates = []
+        for (local_pos, gi, d), units in zip(kept, doc_units):
+            m = len(units)
+            h = entropy_of_similarity(para_emb[offset:offset + m]) if m >= 2 else 0.0
+            offset += m
+            candidates.append({"local_pos": local_pos, "gi": gi, "density": d, "entropy": h})
+
+        # (3) Keep top-TOP_FRACTION by entropy (paper: "prioritize higher H(D)").
+        candidates.sort(key=lambda x: x["entropy"], reverse=True)
+        keep_n = max(1, int(len(candidates) * TOP_FRACTION))
+        for cand in candidates[:keep_n]:
+            high_quality.append({
+                "lang": lang,
+                "title": titles[cand["gi"]],
+                "text": paragraphs[cand["gi"]],
+                "index": indices[cand["gi"]],
+                "cluster_id": c,
+                "density": cand["density"],
+                "entropy": cand["entropy"],
+            })
+
+    write_jsonl(os.path.join(out_dir, f"{lang}_high_quality.jsonl"), high_quality)
+    print(f"[{lang}] C_high = {len(high_quality)} candidates")
+
+
+def run(lang_list: List[str] = LANG_LIST) -> None:
+    if not SINGLE_LANG_OUTPUT_DIR:
+        raise SystemExit("config.SINGLE_LANG_OUTPUT_DIR is empty; fill it in config.py")
+    os.makedirs(SINGLE_LANG_OUTPUT_DIR, exist_ok=True)
+    embedder = get_embedder()  # loaded once, reused across languages
+    for lang in lang_list:
+        print(f"\n=== Stage 1: {lang} ===")
+        _process_lang(lang, embedder, SINGLE_LANG_OUTPUT_DIR)
+
 
 if __name__ == "__main__":
     run()
-
-

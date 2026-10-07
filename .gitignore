@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# HuggingFace datasets cache
+dataset_cache/
+.cache/
+datasets_cache/
+
+# Pipeline outputs (regenerate by running the scripts)
+ner_processed_data/
+output_single_lang_clusters/
+multi_lang_output/
+sample_result/
+
+# Local scratch / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# MyFlicker session metadata (per-machine, not source)
+.codeflicker/
